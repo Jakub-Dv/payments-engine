@@ -1,50 +1,58 @@
-use clap::Parser;
+use std::io::{Read, Write};
+
 use eyre::Context;
 
 mod domain;
 mod tx_processor;
 
-use crate::domain::Row;
-use crate::tx_processor::TransactionsProcessor;
+use domain::Row;
+use tx_processor::TransactionsProcessor;
 
-#[derive(Parser, Debug)]
-#[command(version, about)]
-struct Args {
-    input_file: String,
-}
-
-pub fn run() -> eyre::Result<()> {
-    let args = Args::parse();
-
-    let mut csv_reader = csv::ReaderBuilder::new()
+/// Processes transaction CSV from `input`, writing account balances to `output`.
+/// Rejected transactions are logged and skipped. Unknown dispute references are ignored.
+///
+/// # Errors
+/// Returns an error for malformed CSV, missing columns, read failures, or write failures.
+/// No balances are written until the complete input has been processed.
+pub fn process(input: impl Read, output: impl Write) -> eyre::Result<()> {
+    let mut reader = csv::ReaderBuilder::new()
         .trim(csv::Trim::All)
-        .from_path(&args.input_file)
-        .with_context(|| format!("Failed to read file: {}", args.input_file))?;
+        .from_reader(input);
 
-    let mut tx_processor = TransactionsProcessor::new();
-
-    for row in csv_reader.deserialize() {
-        let row: Row = row.with_context(|| "Failed to deserialize row")?;
-        if let Err(e) = tx_processor.process_row(row) {
-            tracing::error!(
-                action = "process-row",
-                error = format!("{e:#}"),
-                "Failed to process row"
+    let headers = reader.headers().context("reading CSV headers failed")?;
+    if !headers.is_empty() {
+        for required in ["type", "client", "tx", "amount"] {
+            eyre::ensure!(
+                headers.iter().filter(|header| *header == required).count() == 1,
+                "CSV must contain exactly one '{required}' column"
             );
         }
     }
 
-    let writer = std::io::LineWriter::new(std::io::stdout());
-    let mut csv_writer = csv::Writer::from_writer(writer);
-
-    for output_row in tx_processor.get_output() {
-        csv_writer
-            .serialize(output_row)
-            .with_context(|| "Failed to serialize row")?;
+    let mut processor = TransactionsProcessor::default();
+    for row in reader.deserialize::<Row>() {
+        let row = row.context("deserializing transaction failed")?;
+        if let Err(error) = processor.process_row(row) {
+            tracing::warn!(
+                client = %error.client_id,
+                tx = %error.tx_id,
+                error = ?error,
+                "transaction rejected"
+            );
+        }
     }
-    csv_writer
-        .flush()
-        .with_context(|| "Failed to flush output")?;
 
+    let mut writer = csv::WriterBuilder::new()
+        .has_headers(false)
+        .from_writer(output);
+    writer
+        .write_record(["client", "available", "held", "total", "locked"])
+        .context("writing account headers failed")?;
+    for account in processor.into_output() {
+        writer
+            .serialize(account)
+            .context("writing account failed")?;
+    }
+    writer.flush().context("flushing account output failed")?;
     Ok(())
 }
